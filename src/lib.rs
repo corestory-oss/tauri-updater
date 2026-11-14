@@ -1,3 +1,4 @@
+// Modified by CoreStory: pluggable artifact verification and shared manifest support.
 // Copyright 2019-2023 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
@@ -18,6 +19,7 @@
     html_logo_url = "https://github.com/tauri-apps/tauri/raw/dev/app-icon.png",
     html_favicon_url = "https://github.com/tauri-apps/tauri/raw/dev/app-icon.png"
 )]
+#![doc = include_str!("../README.md")]
 
 use std::{ffi::OsString, sync::Arc};
 
@@ -31,10 +33,12 @@ use tauri::{
 mod commands;
 mod config;
 mod error;
+mod manifest;
 mod updater;
 
 pub use config::Config;
 pub use error::{Error, Result};
+pub use manifest::{ManifestAsset, ManifestAssetSelector};
 pub use updater::*;
 
 /// Extensions to [`tauri::App`], [`tauri::AppHandle`], [`tauri::WebviewWindow`], [`tauri::Webview`] and [`tauri::Window`] to access the updater APIs.
@@ -83,9 +87,13 @@ impl<R: Runtime, T: Manager<R>> UpdaterExt<R> for T {
             target,
             version_comparator,
             headers,
+            verifier,
+            manifest_asset_selector,
         } = self.state::<UpdaterState>().inner();
 
-        let mut builder = UpdaterBuilder::new(app, config.clone()).headers(headers.clone());
+        let mut builder = UpdaterBuilder::new(app, config.clone())
+            .headers(headers.clone())
+            .shared_hooks(verifier.clone(), manifest_asset_selector.clone());
 
         if let Some(target) = target {
             builder = builder.target(target);
@@ -135,6 +143,8 @@ struct UpdaterState {
     config: Config,
     version_comparator: Option<VersionComparator>,
     headers: HeaderMap,
+    verifier: Option<ArtifactVerifier>,
+    manifest_asset_selector: Option<ManifestAssetSelector>,
 }
 
 /// Builder for the updater plugin.
@@ -158,6 +168,8 @@ pub struct Builder {
     pubkey: Option<String>,
     installer_args: Vec<OsString>,
     headers: HeaderMap,
+    verifier: Option<ArtifactVerifier>,
+    manifest_asset_selector: Option<ManifestAssetSelector>,
     default_version_comparator: Option<VersionComparator>,
 }
 
@@ -177,6 +189,25 @@ impl Builder {
     /// `{os}-{arch}` in the manifest.
     pub fn target(mut self, target: impl Into<String>) -> Self {
         self.target.replace(target.into());
+        self
+    }
+
+    /// Replaces Minisign with a verification policy for every updater, including JS commands.
+    /// Return an error to prevent extraction and installation of the supplied bytes.
+    pub fn verifier<F>(mut self, verifier: F) -> Self
+    where
+        F: Fn(&Update, &[u8]) -> std::result::Result<(), VerificationError> + Send + Sync + 'static,
+    {
+        self.verifier = Some(Arc::new(verifier));
+        self
+    }
+
+    /// Selects an asset by index from the newest semver release of a self_update manifest.
+    pub fn manifest_asset_selector<F>(mut self, selector: F) -> Self
+    where
+        F: Fn(&[ManifestAsset]) -> Option<usize> + Send + Sync + 'static,
+    {
+        self.manifest_asset_selector = Some(Arc::new(selector));
         self
     }
 
@@ -271,6 +302,8 @@ impl Builder {
         let version_comparator = self.default_version_comparator;
         let installer_args = self.installer_args;
         let headers = self.headers;
+        let verifier = self.verifier;
+        let manifest_asset_selector = self.manifest_asset_selector;
         PluginBuilder::<R, Config>::new("updater")
             .setup(move |app, api| {
                 let mut config = api.config().clone();
@@ -285,6 +318,8 @@ impl Builder {
                     config,
                     version_comparator,
                     headers,
+                    verifier,
+                    manifest_asset_selector,
                 });
                 Ok(())
             })

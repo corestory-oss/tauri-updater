@@ -1,3 +1,4 @@
+// Modified by CoreStory: pluggable artifact verification and shared manifest support.
 // Copyright 2019-2023 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
@@ -123,6 +124,15 @@ pub enum Error {
         "The update signature does not specify the version it was signed for, which `requireSignedVersion` requires. Re-sign and re-publish this release, or disable `requireSignedVersion`."
     )]
     MissingSignedVersion,
+    /// Neither a custom verifier nor a Minisign public key was configured.
+    #[error("configure a custom verifier or a Minisign public key before verifying updates")]
+    MissingVerifier,
+    /// A caller-supplied verifier rejected the package.
+    #[error("custom update verification failed: {0}")]
+    Verification(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// A manifest could not be interpreted or its asset selection was invalid.
+    #[error("invalid release manifest: {0}")]
+    Manifest(String),
     /// Tauri errors.
     #[error(transparent)]
     Tauri(#[from] tauri::Error),

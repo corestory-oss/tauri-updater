@@ -1,3 +1,4 @@
+// Modified by CoreStory: pluggable artifact verification and shared manifest support.
 // Copyright 2019-2023 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
@@ -112,7 +113,7 @@ pub struct Config {
     pub dangerous_accept_invalid_hostnames: bool,
     /// Updater endpoints.
     pub endpoints: Vec<Url>,
-    /// Signature public key.
+    /// Minisign public key. May be omitted when a custom verifier is configured.
     pub pubkey: String,
     /// Require the update signature to carry the version it was signed for, and reject the
     /// update when that version differs from the one announced by the update endpoint.
@@ -131,6 +132,7 @@ pub struct Config {
     /// This is checked independently of the version comparison: it constrains which artifact a
     /// given version number may resolve to, not whether that version is newer.
     ///
+    /// Applies only to Minisign. A custom verifier must enforce its own version binding.
     /// The default value of this flag is `false`.
     pub require_signed_version: bool,
     /// Allow the updater to install a release whose version is not newer than the
@@ -166,6 +168,7 @@ impl<'de> Deserialize<'de> for Config {
             pub dangerous_accept_invalid_hostnames: bool,
             #[serde(default)]
             pub endpoints: Vec<Url>,
+            #[serde(default)]
             pub pubkey: String,
             #[serde(default, alias = "require-signed-version")]
             pub require_signed_version: bool,

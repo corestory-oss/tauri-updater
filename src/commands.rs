@@ -1,3 +1,4 @@
+// Modified by CoreStory: execute JS installation policies on a blocking worker.
 // Copyright 2019-2023 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
@@ -8,7 +9,7 @@ use http::{HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
 use tauri::{Manager, Resource, ResourceId, Runtime, Webview, ipc::Channel};
 
-use std::{str::FromStr, time::Duration};
+use std::{str::FromStr, sync::Arc, time::Duration};
 use url::Url;
 
 #[derive(Debug, Clone, Serialize)]
@@ -145,17 +146,22 @@ pub(crate) async fn install<R: Runtime>(
         .resources_table()
         .get::<DownloadedBytes>(bytes_rid)?;
 
+    let mut update = (*update).clone();
     if let Some(restart_after_install) = restart_after_install {
-        let update = (*update).clone();
-        update
-            .restart_after_install(restart_after_install)
-            .install(&bytes.0)?;
-    } else {
-        update.install(&bytes.0)?;
+        update = update.restart_after_install(restart_after_install);
     }
+    install_bytes(update, bytes).await?;
 
     let _ = webview.resources_table().close(bytes_rid);
     Ok(())
+}
+
+// Custom verifiers may perform blocking I/O or cryptography. Keep JS-triggered direct
+// installation off the async executor just as Update::download does for verification.
+async fn install_bytes(update: Update, bytes: Arc<DownloadedBytes>) -> Result<()> {
+    tauri::async_runtime::spawn_blocking(move || update.install(&bytes.0))
+        .await
+        .map_err(|error| crate::Error::Verification(Box::new(error)))?
 }
 
 #[tauri::command]
@@ -205,4 +211,57 @@ pub(crate) async fn download_and_install<R: Runtime>(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn plugin_policy_reaches_js_install_on_a_blocking_worker() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let caller = std::thread::current().id();
+        let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+        context
+            .config_mut()
+            .plugins
+            .0
+            .insert("updater".into(), serde_json::json!({}));
+        let app = tauri::test::mock_builder()
+            .plugin(
+                crate::Builder::new()
+                    .verifier(move |update, bytes| {
+                        assert_ne!(std::thread::current().id(), caller);
+                        assert_eq!(update.version, "9.0.0");
+                        assert_eq!(bytes, b"unapproved artifact");
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        Err(std::io::Error::other("rejected by application policy").into())
+                    })
+                    .build(),
+            )
+            .build(context)
+            .unwrap();
+        let update = app
+            .updater_builder()
+            .endpoints(vec![
+                "https://updates.example/manifest.json".parse().unwrap(),
+            ])
+            .unwrap()
+            .executable_path("unused/app")
+            .build()
+            .unwrap()
+            .restore_update(serde_json::json!({
+                "version":"9.0.0", "url":"https://updates.example/app"
+            }))
+            .unwrap()
+            .unwrap();
+        let result = tauri::async_runtime::block_on(install_bytes(
+            update,
+            Arc::new(DownloadedBytes(b"unapproved artifact".to_vec())),
+        ));
+        assert!(matches!(result, Err(crate::Error::Verification(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 }

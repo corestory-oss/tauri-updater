@@ -1,3 +1,4 @@
+// Modified by CoreStory: pluggable artifact verification and shared manifest support.
 // Copyright 2019-2023 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
@@ -83,6 +84,7 @@ pub struct ReleaseManifestPlatform {
     /// Download URL for the platform
     pub url: Url,
     /// Signature for the platform
+    #[serde(default)]
     pub signature: String,
 }
 
@@ -149,6 +151,15 @@ pub type OnBeforeExit = Arc<dyn Fn() + Send + Sync + 'static>;
 /// Function that customizes the `reqwest` client builder used for the updater requests.
 /// See [`UpdaterBuilder::configure_client`].
 pub type OnBeforeRequest = Arc<dyn Fn(ClientBuilder) -> ClientBuilder + Send + Sync + 'static>;
+/// Error returned by a caller-supplied artifact verifier.
+pub type VerificationError = Box<dyn std::error::Error + Send + Sync + 'static>;
+/// Synchronous verification policy, called with the exact bytes to install and update metadata.
+/// A configured verifier replaces Minisign. It must return an error to reject an artifact.
+/// Download verification runs on a blocking worker; direct `install` and `verify` calls run
+/// on the calling thread. The callback can run more than once for the same update.
+pub type ArtifactVerifier =
+    Arc<dyn Fn(&Update, &[u8]) -> std::result::Result<(), VerificationError> + Send + Sync>;
+
 /// Function that decides whether a remote release must be installed.
 ///
 /// It receives the current application version and the remote release,
@@ -165,6 +176,8 @@ type RunOnMainThread = Arc<dyn Fn(MainThreadClosure) -> tauri::Result<()> + Send
 struct UpdaterContext {
     config: Config,
     configure_client: Option<OnBeforeRequest>,
+    verifier: Option<ArtifactVerifier>,
+    manifest_asset_selector: Option<crate::ManifestAssetSelector>,
     #[cfg(target_os = "macos")]
     run_on_main_thread: RunOnMainThread,
     /// App name, used for creating named tempfiles
@@ -214,6 +227,8 @@ impl UpdaterBuilder {
                     .unwrap_or_default(),
                 config,
                 configure_client: None,
+                verifier: None,
+                manifest_asset_selector: None,
                 #[cfg(target_os = "macos")]
                 run_on_main_thread,
                 #[cfg(windows)]
@@ -342,6 +357,36 @@ impl UpdaterBuilder {
     /// Clear all proxies. See [`reqwest::ClientBuilder::no_proxy`](https://docs.rs/reqwest/latest/reqwest/struct.ClientBuilder.html#method.no_proxy).
     pub fn no_proxy(mut self) -> Self {
         self.no_proxy = true;
+        self
+    }
+
+    /// Replaces Minisign verification with the supplied policy.
+    /// The callback must authenticate the supplied bytes before returning success.
+    pub fn verifier<F>(mut self, verifier: F) -> Self
+    where
+        F: Fn(&Update, &[u8]) -> std::result::Result<(), VerificationError> + Send + Sync + 'static,
+    {
+        self.context.verifier = Some(Arc::new(verifier));
+        self
+    }
+
+    /// Selects an asset from a self_update manifest. Return its index, or None to reject it.
+    /// No filename or platform guessing is performed when a selector is absent.
+    pub fn manifest_asset_selector<F>(mut self, selector: F) -> Self
+    where
+        F: Fn(&[crate::ManifestAsset]) -> Option<usize> + Send + Sync + 'static,
+    {
+        self.context.manifest_asset_selector = Some(Arc::new(selector));
+        self
+    }
+
+    pub(crate) fn shared_hooks(
+        mut self,
+        verifier: Option<ArtifactVerifier>,
+        selector: Option<crate::ManifestAssetSelector>,
+    ) -> Self {
+        self.context.verifier = verifier;
+        self.context.manifest_asset_selector = selector;
         self
     }
 
@@ -582,9 +627,19 @@ impl Updater {
             }
 
             let mut request = ClientBuilder::new().user_agent(UPDATER_USER_AGENT);
+            #[cfg(any(
+                feature = "rustls-tls",
+                feature = "native-tls",
+                feature = "native-tls-vendored"
+            ))]
             if self.context.config.dangerous_accept_invalid_certs {
                 request = request.danger_accept_invalid_certs(true);
             }
+            #[cfg(any(
+                feature = "rustls-tls",
+                feature = "native-tls",
+                feature = "native-tls-vendored"
+            ))]
             if self.context.config.dangerous_accept_invalid_hostnames {
                 request = request.danger_accept_invalid_hostnames(true);
             }
@@ -620,13 +675,26 @@ impl Updater {
                             return Ok(None);
                         };
 
+                        let manifest_url = res.url().clone();
                         let update_response: serde_json::Value = res.json().await?;
                         log::debug!("update response: {update_response:?}");
-                        raw_json = Some(update_response.clone());
-                        match serde_json::from_value::<RemoteRelease>(update_response)
-                            .map_err(Into::into)
+                        let parsed = if update_response.get("schema").is_some()
+                            || update_response.get("releases").is_some()
                         {
-                            Ok(release) => {
+                            crate::manifest::parse_manifest(
+                                update_response,
+                                &manifest_url,
+                                self.context.manifest_asset_selector.as_ref(),
+                            )
+                        } else {
+                            serde_json::from_value::<RemoteRelease>(update_response.clone())
+                                .map(|release| Some((release, update_response)))
+                                .map_err(Into::into)
+                        };
+                        match parsed {
+                            Ok(None) => return Ok(None),
+                            Ok(Some((release, metadata))) => {
+                                raw_json = Some(metadata);
                                 log::debug!("parsed release response {release:?}");
                                 last_error = None;
                                 remote_release = Some(release);
@@ -669,7 +737,9 @@ impl Updater {
     /// configuration, including the public key and installation path, comes from this updater,
     /// not from the cached metadata. Returns `None` if the release is no longer an update.
     ///
-    /// The cached metadata is not authenticated, so the restored update always requires the
+    /// With a custom verifier, cached metadata remains untrusted: the callback must enforce
+    /// any required binding of artifact bytes to version, product and platform itself.
+    /// With Minisign, the cached metadata is not authenticated, so the restored update requires the
     /// package signature to bind the announced version, as if [`Config::require_signed_version`]
     /// was enabled. Otherwise modified metadata could pair a newer version number with an older,
     /// validly signed package. Packages signed without a version (by Tauri CLI releases that
@@ -840,9 +910,19 @@ impl Update {
         }
 
         let mut request = ClientBuilder::new().user_agent(UPDATER_USER_AGENT);
+        #[cfg(any(
+            feature = "rustls-tls",
+            feature = "native-tls",
+            feature = "native-tls-vendored"
+        ))]
         if self.context.config.dangerous_accept_invalid_certs {
             request = request.danger_accept_invalid_certs(true);
         }
+        #[cfg(any(
+            feature = "rustls-tls",
+            feature = "native-tls",
+            feature = "native-tls-vendored"
+        ))]
         if self.context.config.dangerous_accept_invalid_hostnames {
             request = request.danger_accept_invalid_hostnames(true);
         }
@@ -888,17 +968,28 @@ impl Update {
         }
         on_download_finish();
 
-        self.verify(&buffer)?;
-
-        Ok(buffer)
+        // User verification can perform CPU-heavy cryptography or blocking I/O.
+        let update = self.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            update.verify(&buffer)?;
+            Ok(buffer)
+        })
+        .await
+        .map_err(|error| Error::Verification(Box::new(error)))?
     }
 
-    /// Verifies package bytes using this update's signature and the configured public key.
+    /// Verifies package bytes with the configured custom verifier, or Minisign public key.
     ///
     /// This performs the same checks as [`Self::download`] and [`Self::install`], including
     /// signed-version validation, without making a request or installing anything. Use it to
     /// discard a corrupted or tampered cached package early.
     pub fn verify(&self, bytes: &[u8]) -> Result<()> {
+        if let Some(verifier) = &self.context.verifier {
+            return verifier(self, bytes).map_err(Error::Verification);
+        }
+        if self.context.config.pubkey.trim().is_empty() {
+            return Err(Error::MissingVerifier);
+        }
         verify_signature(
             bytes,
             &self.signature,
@@ -911,8 +1002,8 @@ impl Update {
     /// Installs the updater package downloaded by [`Update::download`] or cached from a previous
     /// download.
     ///
-    /// The bytes are verified with [`Self::verify`] first, so a package that does not match this
-    /// update's signature is never installed.
+    /// The bytes are checked with [`Self::verify`] first. A rejection by the configured
+    /// verification policy prevents extraction and installation.
     ///
     /// ## Platform-specific:
     ///
@@ -1859,9 +1950,7 @@ impl<'de> Deserialize<'de> for RemoteRelease {
                     url: release.url.ok_or_else(|| {
                         DeError::custom("the `url` field was not set on the updater response")
                     })?,
-                    signature: release.signature.ok_or_else(|| {
-                        DeError::custom("the `signature` field was not set on the updater response")
-                    })?,
+                    signature: release.signature.unwrap_or_default(),
                 })
             },
         })
@@ -2160,6 +2249,140 @@ mod offline_tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn custom_verifier_replaces_minisign_and_guards_direct_install() {
+        let updater = builder()
+            .pubkey("invalid-minisign-key")
+            .verifier(|update, bytes| {
+                assert_eq!(update.version, "2.0.0");
+                if bytes == b"approved" {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other("rejected by caller").into())
+                }
+            })
+            .build()
+            .unwrap();
+        let metadata = json!({"version":"2.0.0","url":"https://example.invalid/artifact"});
+        let update = updater.restore_update(metadata).unwrap().unwrap();
+        assert!(update.signature.is_empty());
+        update.verify(b"approved").unwrap();
+        assert!(matches!(
+            update.verify(b"changed"),
+            Err(Error::Verification(_))
+        ));
+        assert!(matches!(
+            update.install(b"changed"),
+            Err(Error::Verification(_))
+        ));
+    }
+
+    #[test]
+    fn missing_verifier_fails_closed_without_requiring_config_key() {
+        let config: Config = serde_json::from_value(json!({})).unwrap();
+        assert!(config.pubkey.is_empty());
+        let updater = builder().pubkey("").build().unwrap();
+        let update = updater
+            .restore_update(json!({"version":"2.0.0","url":"https://example.invalid/artifact"}))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            update.verify(b"bytes"),
+            Err(Error::MissingVerifier)
+        ));
+        assert!(matches!(
+            update.install(b"bytes"),
+            Err(Error::MissingVerifier)
+        ));
+    }
+
+    #[test]
+    fn manifest_download_and_combined_install_enforce_verification() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Test both a successful download and a rejected combined download/install.
+        for reject in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!(
+                "http://{}/feed/manifest.json",
+                listener.local_addr().unwrap()
+            );
+            let manifest = json!({"schema":1,"releases":[{"version":"2.0.0","assets":[
+                {"name":"desktop.app.tar.gz","url":"artifact","digest":"sha256:example","proof":"caller-proof"}
+            ]}]}).to_string();
+            let server = std::thread::spawn(move || {
+                for (path, body) in [
+                    ("/feed/manifest.json", manifest.as_bytes()),
+                    ("/feed/artifact", b"artifact bytes".as_slice()),
+                ] {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut reader = BufReader::new(&mut socket);
+                    let mut request = String::new();
+                    reader.read_line(&mut request).unwrap();
+                    assert!(request.starts_with(&format!("GET {path} ")));
+                    loop {
+                        let mut line = String::new();
+                        assert!(reader.read_line(&mut line).unwrap() > 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                    }
+                    write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).unwrap();
+                    socket.write_all(body).unwrap();
+                }
+            });
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed_calls = calls.clone();
+            let caller_thread = std::thread::current().id();
+            let mut builder = builder()
+                .pubkey("")
+                .configure_client(|client| client)
+                .manifest_asset_selector(|assets| {
+                    assets.iter().position(|a| a.name == "desktop.app.tar.gz")
+                })
+                .verifier(move |update, bytes| {
+                    assert_ne!(std::thread::current().id(), caller_thread);
+                    observed_calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(bytes, b"artifact bytes");
+                    assert_eq!(update.raw_json["asset"]["proof"], "caller-proof");
+                    if reject {
+                        Err(std::io::Error::other("policy rejected").into())
+                    } else {
+                        Ok(())
+                    }
+                });
+            builder.context.config.dangerous_insecure_transport_protocol = true;
+            let updater = builder
+                .endpoints(vec![endpoint.parse().unwrap()])
+                .unwrap()
+                .build()
+                .unwrap();
+            let update = tauri::async_runtime::block_on(updater.check())
+                .unwrap()
+                .unwrap();
+            if reject {
+                let result =
+                    tauri::async_runtime::block_on(update.download_and_install(|_, _| {}, || {}));
+                assert!(matches!(result, Err(Error::Verification(_))));
+            } else {
+                let bytes =
+                    tauri::async_runtime::block_on(update.download(|_, _| {}, || {})).unwrap();
+                assert_eq!(bytes, b"artifact bytes");
+                let restored = updater
+                    .restore_update(update.raw_json.clone())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(restored.download_url, update.download_url);
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            server.join().unwrap();
+        }
     }
 
     #[test]
